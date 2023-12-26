@@ -1,0 +1,5 @@
+numpy
+onnxruntime-gpu
+onnxruntime-directml
+fastapi
+uvicorn[standard]
