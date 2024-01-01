@@ -1,3 +1,4 @@
+import argparse
 import logging
 from pathlib import Path
 from typing import Dict
@@ -11,14 +12,26 @@ from fastapi import FastAPI, HTTPException
 
 from nvSTFT import STFT
 
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("openutau-remote-inference")
+LOGGER.setLevel(logging.INFO)
+
 ONNX_SESSIONS = {}
 TORCHSCRIPT_MODELS = {}
 
+parser = argparse.ArgumentParser()
+parser.add_argument("-d", "--model_root_dir", type=str, default=str(Path(__file__).parent), help="root directory containing models")
+args = parser.parse_args()
+args.model_root_dir = Path(args.model_root_dir).resolve()
+
 app = FastAPI()
 
-@app.post("/inference/{model_path}")
-def inference(model_path: Path, body: Dict):
+@app.post("/inference")
+async def inference(body: Dict):
+    model_path = Path(body['model_path'])
+    body_inputs = body['inputs']
+    if not model_path.is_absolute():
+        model_path = args.model_root_dir / model_path
     if model_path not in ONNX_SESSIONS:
         LOGGER.warn(f"Model {model_path} not loaded, loading now")
         ONNX_SESSIONS[model_path] = ort.InferenceSession(
@@ -36,9 +49,9 @@ def inference(model_path: Path, body: Dict):
 
     inputs = {}
     for model_input in session.get_inputs():
-        if model_input.name not in body:
+        if model_input.name not in body_inputs:
             raise Exception(f"Input {model_input.name} not found in request body")
-        input = body[model_input.name]
+        input = body_inputs[model_input.name]
         type_str = input["type"][7:-1]
         if (
             "type" not in input
@@ -75,6 +88,7 @@ def inference(model_path: Path, body: Dict):
                     }
                 }
             else:
+                # Deal with ddsp-hifigan logic
                 try:
                     stft = STFT(
                         vocoder_config['sample_rate'],
@@ -102,11 +116,6 @@ def inference(model_path: Path, body: Dict):
     }
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s"
-    )
-    LOGGER.setLevel(logging.INFO)
-
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
