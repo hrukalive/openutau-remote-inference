@@ -1,7 +1,8 @@
 import argparse
 import logging
+import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 import onnxruntime as ort
@@ -10,7 +11,6 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException
 
-from nvSTFT import STFT
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("openutau-remote-inference")
@@ -20,18 +20,37 @@ ONNX_SESSIONS = {}
 TORCHSCRIPT_MODELS = {}
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-d", "--model_root_dir", type=str, default=str(Path(__file__).parent), help="root directory containing models")
+parser.add_argument("-d", "--root_dir", type=str, default=str(Path(__file__).parent), help="root directory containing models")
 args = parser.parse_args()
-args.model_root_dir = Path(args.model_root_dir).resolve()
+args.root_dir = Path(args.root_dir).resolve()
+LOGGER.info(f"Model root directory: {args.root_dir}")
 
 app = FastAPI()
 
-@app.post("/inference")
-async def inference(body: Dict):
-    model_path = Path(body['model_path'])
-    body_inputs = body['inputs']
-    if not model_path.is_absolute():
-        model_path = args.model_root_dir / model_path
+def process_path(filepath: str) -> Path:
+    filepath = Path(filepath)
+    if not filepath.is_absolute():
+        filepath = args.root_dir / filepath
+    real_filepath = os.path.realpath(filepath)
+    real_root_dir = os.path.realpath(args.root_dir)
+    if Path(os.path.commonprefix([real_filepath, real_root_dir])) != Path(real_root_dir):
+        raise HTTPException(status_code=403, detail="Path provided is not a subpath of the root directory.")
+    return filepath
+
+@app.get("/ping")
+async def ping() -> str:
+    return "pong"
+
+@app.get("/exists")
+async def exists(model_path: str) -> bool:
+    model_path = process_path(model_path)
+    return model_path.exists()
+
+@app.get("/onnx_info/inputs")
+async def onnx_input_names(model_path: str) -> List[str]:
+    model_path = process_path(model_path)
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail=f"ONNX model {model_path.relative_to(args.root_dir)} not found")
     if model_path not in ONNX_SESSIONS:
         LOGGER.warn(f"Model {model_path} not loaded, loading now")
         ONNX_SESSIONS[model_path] = ort.InferenceSession(
@@ -46,11 +65,65 @@ async def inference(body: Dict):
         )
         LOGGER.info(f"Model {model_path} loaded")
     session = ONNX_SESSIONS[model_path]
+    return [input.name for input in session.get_inputs()]
+
+@app.post("/inference")
+async def inference(body: Dict):
+    model_path = process_path(body['model_path'])
+    body_inputs = body['inputs']
+
+    # Special case for DDSP vocoder
+    if (model_path.parent / 'vocoder.yaml').exists():
+        vocoder_config = yaml.safe_load((model_path.parent / 'vocoder.yaml').read_text())
+        if vocoder_config.get('model_type', 'onnx') == 'jit':
+            jit_model_path = model_path.with_suffix('.jit')
+            if not jit_model_path.exists():
+                raise HTTPException(status_code=404, detail=f"Torchscript model {jit_model_path.relative_to(args.root_dir)} not found")
+            if jit_model_path not in TORCHSCRIPT_MODELS:
+                TORCHSCRIPT_MODELS[jit_model_path] = torch.jit.load(model_path.with_suffix('.jit'), map_location=torch.device('cpu'))
+                TORCHSCRIPT_MODELS[jit_model_path].eval()
+                LOGGER.info(f"Vocoder {model_path.with_suffix('.jit')} loaded")
+            vocoder_model = TORCHSCRIPT_MODELS[jit_model_path]
+            for k in ['mel', 'f0']:
+                if k not in body_inputs:
+                    raise HTTPException(status_code=400, detail=f"Input {k} not found in request body")
+                if body_inputs[k]['type'] != 'tensor(float)':
+                    raise HTTPException(status_code=400, detail=f"Input {k} must be tensor(float)")
+            mel_input, f0_input = body_inputs['mel'], body_inputs['f0']
+            with torch.no_grad():
+                signal, _, _ = vocoder_model(
+                    torch.from_numpy(np.array(mel_input["float_data"], dtype=np.dtype("float32")).reshape(mel_input["shape"])),
+                    torch.from_numpy(np.array(f0_input["float_data"], dtype=np.dtype("float32")).reshape(f0_input["shape"])).unsqueeze(-1)
+                )
+            return {
+                'waveform': {
+                    'type': 'tensor(float)',
+                    'shape': signal.shape,
+                    'float_data': signal.flatten().tolist(),
+                }
+            }
+
+    if not model_path.exists():
+        raise HTTPException(status_code=404, detail=f"ONNX model {model_path.relative_to(args.root_dir)} not found")
+    if model_path not in ONNX_SESSIONS:
+        LOGGER.warn(f"Model {model_path.relative_to(args.root_dir)} not loaded, loading now")
+        ONNX_SESSIONS[model_path] = ort.InferenceSession(
+            model_path,
+            providers=[
+                'TensorrtExecutionProvider',
+                'CUDAExecutionProvider',
+                "DmlExecutionProvider",
+                "CoreMLExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+        )
+        LOGGER.info(f"Model {model_path.relative_to(args.root_dir)} loaded")
+    session = ONNX_SESSIONS[model_path]
 
     inputs = {}
     for model_input in session.get_inputs():
         if model_input.name not in body_inputs:
-            raise Exception(f"Input {model_input.name} not found in request body")
+            raise HTTPException(status_code=400, detail=f"Input {model_input.name} not found in request body")
         input = body_inputs[model_input.name]
         type_str = input["type"][7:-1]
         if (
@@ -58,51 +131,16 @@ async def inference(body: Dict):
             or "shape" not in input
             or f"{type_str}_data" not in input
         ):
-            raise Exception(f"Input {model_input.name} has invalid format")
+            raise HTTPException(status_code=400, detail=f"Input {model_input.name} has invalid format")
         if model_input.type != input["type"]:
-            raise Exception(
-                f"Input {model_input.name} has type {input['type']} but expected {model_input.type}"
+            raise HTTPException(
+                status_code=400,
+                detail=f"Input {model_input.name} has type {input['type']} but expected {model_input.type}"
             )
         inputs[model_input.name] = np.array(
             input[f"{type_str}_data"],
             dtype=np.dtype(type_str if type_str != "float" else "float32"),
         ).reshape(input["shape"])
-
-    if (model_path.parent / 'vocoder.yaml').exists() and model_path.with_suffix('.jit').exists():
-        vocoder_config = yaml.safe_load((model_path.parent / 'vocoder.yaml').read_text())
-        if vocoder_config.get('model_type', 'onnx') in ['jit', 'combined']:
-            jit_model_path = model_path.with_suffix('.jit')
-            if jit_model_path not in TORCHSCRIPT_MODELS:
-                TORCHSCRIPT_MODELS[jit_model_path] = torch.jit.load(model_path.with_suffix('.jit'), map_location=torch.device('cpu'))
-                TORCHSCRIPT_MODELS[jit_model_path].eval()
-                LOGGER.info(f"Vocoder {model_path.with_suffix('.jit')} loaded")
-            vocoder_model = TORCHSCRIPT_MODELS[jit_model_path]
-            with torch.no_grad():
-                signal, _, _ = vocoder_model(torch.from_numpy(inputs['mel']), torch.from_numpy(inputs['f0']).unsqueeze(-1))
-            if vocoder_config.get('model_type', 'onnx') == 'jit':
-                return {
-                    'waveform': {
-                        'type': 'tensor(float)',
-                        'shape': signal.shape,
-                        'float_data': signal.flatten().tolist(),
-                    }
-                }
-            else:
-                # Deal with ddsp-hifigan logic
-                try:
-                    stft = STFT(
-                        vocoder_config['sample_rate'],
-                        vocoder_config['num_mel_bins'],
-                        vocoder_config['n_fft'],
-                        vocoder_config['win_length'],
-                        vocoder_config['hop_size'],
-                        vocoder_config['mel_fmin'],
-                        vocoder_config['mel_fmax'],
-                    )
-                except KeyError as e:
-                    raise HTTPException(status_code=500, detail=f"Vocoder config file {model_path.parent / 'vocoder.yaml'} is missing key {e}")
-                new_mel = stft.get_mel(signal).cpu().numpy()
-                inputs['mel'] = new_mel.transpose(0, 2, 1)
 
     outputs = session.run(None, inputs)
     model_outputs = session.get_outputs()
