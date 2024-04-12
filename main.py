@@ -67,6 +67,21 @@ async def onnx_input_names(model_path: str) -> List[str]:
     session = ONNX_SESSIONS[model_path]
     return [input.name for input in session.get_inputs()]
 
+@app.post("/release")
+async def release(body: Dict):
+    model_path = process_path(body['model_path'])
+    if model_path in ONNX_SESSIONS:
+        del ONNX_SESSIONS[model_path]
+        LOGGER.info(f"Model {model_path.relative_to(args.root_dir)} released")
+    if (model_path.parent / 'vocoder.yaml').exists():
+        vocoder_config = yaml.safe_load((model_path.parent / 'vocoder.yaml').read_text())
+        if vocoder_config.get('model_type', 'onnx') == 'jit':
+            jit_model_path = model_path.with_suffix('.jit')
+            if jit_model_path in TORCHSCRIPT_MODELS:
+                del TORCHSCRIPT_MODELS[jit_model_path]
+                LOGGER.info(f"Vocoder {model_path.with_suffix('.jit')} released")
+    return "ok"
+
 @app.post("/inference")
 async def inference(body: Dict):
     model_path = process_path(body['model_path'])
